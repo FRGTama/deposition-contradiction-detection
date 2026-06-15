@@ -1,4 +1,10 @@
 import { useMemo, useState } from "react";
+import type { AnalysisResult, ContradictionType } from "./types";
+import { countByType, labelForFilter } from "./utils";
+import { ClaimBlock } from "./components/ClaimBlock";
+import { Metric } from "./components/Metric";
+import { ScoreBar } from "./components/ScoreBar";
+import { ScorePill } from "./components/ScorePill";
 
 const TRANSCRIPT_1 = `Deposition of Marcus Webb - March 14, 2023
 
@@ -39,57 +45,6 @@ A: I mean, I've driven through that part of town. I didn't say I'd never been in
 
 Q: And Daniel Cho - did you know him?
 A: I knew of him. We had mutual friends. I don't think I'd met him face to face.`;
-
-type ContradictionType = "DIRECT" | "INFERENTIAL" | "FALSE_POSITIVE";
-type RelationFamily =
-  | "location_at_time"
-  | "movement"
-  | "sleep_time"
-  | "ownership"
-  | "knowledge"
-  | "contact"
-  | "action"
-  | "unknown";
-
-interface Claim {
-  id: string;
-  source: "first" | "second";
-  topic: string;
-  subject: string;
-  relation: string;
-  relationFamily: RelationFamily;
-  object: string;
-  polarity: "affirmed" | "negated" | "unknown";
-  uncertaintyMarkers: string[];
-  evidence: string;
-  time?: {
-    raw: string;
-    minutes?: number;
-    approximate: boolean;
-  };
-  location?: string;
-}
-
-interface Contradiction {
-  fr: number;
-  fu: number;
-  confidence: number;
-  topicScore: number;
-  type: ContradictionType;
-  severity: "HIGH" | "MEDIUM" | "LOW";
-  rationale: string;
-  claim1: Claim;
-  claim2: Claim;
-}
-
-interface AnalysisResult {
-  claims: Claim[];
-  contradictions: Contradiction[];
-  provider: string;
-  model: string;
-  embeddingProvider: string;
-  embeddingModel: string;
-}
 
 const FILTERS: Array<ContradictionType | "ALL"> = ["ALL", "DIRECT", "INFERENTIAL", "FALSE_POSITIVE"];
 
@@ -222,76 +177,4 @@ export default function App() {
       )}
     </main>
   );
-}
-
-function Metric({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="metric">
-      <span>{label}</span>
-      <strong>{value}</strong>
-    </div>
-  );
-}
-
-function ClaimBlock({ title, claim }: { title: string; claim: Claim }) {
-  return (
-    <div className="claim-block">
-      <span className="claim-title">{title}</span>
-      <blockquote>{claim.evidence}</blockquote>
-      <dl>
-        <div>
-          <dt>Relation</dt>
-          <dd>
-            {claim.relation} {claim.object}
-          </dd>
-        </div>
-        <div>
-          <dt>Family</dt>
-          <dd>{claim.relationFamily}</dd>
-        </div>
-        <div>
-          <dt>Polarity</dt>
-          <dd>{claim.polarity}</dd>
-        </div>
-      </dl>
-    </div>
-  );
-}
-
-function ScorePill({ label, value }: { label: string; value: number }) {
-  return (
-    <span className="score-pill">
-      {label} {Math.round(value * 100)}%
-    </span>
-  );
-}
-
-function ScoreBar({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="score-bar">
-      <div className="score-label">
-        <span>{label}</span>
-        <span>{Math.round(value * 100)}%</span>
-      </div>
-      <div className="track">
-        <div style={{ width: `${Math.round(value * 100)}%` }} />
-      </div>
-    </div>
-  );
-}
-
-function countByType(items: Contradiction[], type: ContradictionType): number {
-  return items.filter((item) => item.type === type).length;
-}
-
-function labelForFilter(filter: ContradictionType | "ALL"): string {
-  if (filter === "FALSE_POSITIVE") {
-    return "False positive";
-  }
-
-  if (filter === "ALL") {
-    return "All";
-  }
-
-  return filter.charAt(0) + filter.slice(1).toLowerCase();
 }

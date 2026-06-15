@@ -1,17 +1,31 @@
 from __future__ import annotations
 
 import math
-import uuid
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from .embeddings import ClaimEmbedding, claim_to_embedding_text
 from .logger import debug_log, text_preview, vector_preview
 from .models import ExtractedClaim
-from .relation_frames import families_are_comparable
+from .relation_frames import FAMILY_CONSTRAINTS, families_are_comparable
+from .text_utils import normalize_text, round_score, slugify
 
 MIN_CANDIDATE_SIMILARITY = 0.55
 VERY_LOW_CANDIDATE_SIMILARITY = 0.18
+WITNESS_ALIASES = {"i", "me", "my", "myself", "we", "us", "witness"}
+ENTITY_STOPWORDS = {
+    "a", "an", "and", "at", "before", "did", "for", "from",
+    "had", "has", "have", "he", "her", "him", "his", "i", "in",
+    "it", "me", "my", "of", "on", "or", "she", "the", "they",
+    "to", "was", "we", "were", "witness", "you",
+}
+PERIOD_WORDS = {"morning", "afternoon", "evening", "night", "midnight", "noon"}
+WEEKDAYS = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
+MONTHS = {
+    "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+}
 
 
 @dataclass(frozen=True)
@@ -46,19 +60,10 @@ class IndexedClaim:
 class InMemoryClaimVectorStore:
     def __init__(self) -> None:
         self._claims: dict[str, IndexedClaim] = {}
-        self._collection: Any | None = _create_chroma_collection()
 
     def add_claims(self, indexed_claims: list[IndexedClaim]) -> None:
         for indexed_claim in indexed_claims:
             self._claims[indexed_claim.claim.id] = indexed_claim
-
-        if self._collection is not None and indexed_claims:
-            self._collection.add(
-                ids=[indexed_claim.claim.id for indexed_claim in indexed_claims],
-                embeddings=[indexed_claim.vector for indexed_claim in indexed_claims],
-                documents=[indexed_claim.text for indexed_claim in indexed_claims],
-                metadatas=[_chroma_safe_metadata(indexed_claim.metadata) for indexed_claim in indexed_claims],
-            )
 
     def query(
         self,
@@ -69,27 +74,6 @@ class InMemoryClaimVectorStore:
         query_claim = self._claims.get(claim.id)
         if not query_claim:
             return []
-
-        if self._collection is not None:
-            try:
-                result = self._collection.query(
-                    query_embeddings=[query_claim.vector],
-                    n_results=max(limit * 3, limit),
-                    where={"source": source},
-                    include=["distances", "metadatas"],
-                )
-                ids = (result.get("ids") or [[]])[0]
-                distances = (result.get("distances") or [[]])[0]
-                matches: list[tuple[ExtractedClaim, float]] = []
-                for index, claim_id in enumerate(ids):
-                    indexed = self._claims.get(str(claim_id))
-                    if not indexed or indexed.claim.source != source:
-                        continue
-                    distance = float(distances[index]) if index < len(distances) else 1.0
-                    matches.append((indexed.claim, _score_from_chroma_distance(distance)))
-                return matches[:limit]
-            except Exception as error:  # pragma: no cover - chroma fallback path
-                debug_log("vector.query", {"path": "chroma_error_fallback", "error": str(error)})
 
         candidates = [indexed for indexed in self._claims.values() if indexed.claim.source == source]
         scored = [
@@ -122,7 +106,7 @@ async def index_claims(
         {
             "caseId": case_id,
             "count": len(indexed_claims),
-            "path": "chroma" if vector_store._collection is not None else "memory",
+            "path": "memory",
             "claims": [
                 {
                     "claimId": indexed.claim.id,
@@ -159,7 +143,7 @@ async def retrieve_candidate_pairs(
                 "targetSource": "second",
                 "topK": top_k,
                 "matches": [
-                    {"claimId": claim.id, "semanticScore": _round(score)}
+                    {"claimId": claim.id, "semanticScore": round_score(score)}
                     for claim, score in matches
                 ],
             },
@@ -180,7 +164,7 @@ async def retrieve_candidate_pairs(
                 {
                     "claim1Id": first_claim.id,
                     "claim2Id": second_claim.id,
-                    "semanticScore": _round(semantic_score),
+                    "semanticScore": round_score(semantic_score),
                     "relationFamilies": [first_claim.relation_family, second_claim.relation_family],
                     "reasons": reasons,
                 },
@@ -267,15 +251,16 @@ def _metadata_for_claim(case_id: str, claim: ExtractedClaim) -> dict[str, Any]:
 
 
 def frame_for_claim(claim: ExtractedClaim) -> ClaimFrame:
-    entity_keys = _entity_keys(claim)
-    location_key = _location_key(claim.location or claim.object)
-    time_bucket = _time_bucket(claim)
+    subject_key = _subject_key(claim.subject)
+    relation_key = _relation_key(claim)
     object_key = _object_key(claim)
-    relation_key = _relation_key(claim.relation)
-    topic_key = _topic_key(claim, entity_keys, time_bucket, location_key)
+    location_key = _location_key(claim.location or "")
+    entity_keys = _entity_keys(claim)
+    time_bucket = _time_bucket(claim)
+    topic_key = _topic_key(claim, entity_keys, object_key, location_key, time_bucket)
     value_key = _value_key(claim, object_key, location_key, time_bucket)
     return ClaimFrame(
-        subject_key=_subject_key(claim.subject),
+        subject_key=subject_key,
         relation_key=relation_key,
         object_key=object_key,
         entity_keys=tuple(entity_keys),
@@ -288,184 +273,186 @@ def frame_for_claim(claim: ExtractedClaim) -> ClaimFrame:
 
 
 def _subject_key(subject: str) -> str:
-    text = _normalize(subject)
-    if not text or text in {"i", "me", "myself", "marcus webb", "witness"}:
+    text = normalize_text(subject)
+    if not text or text in WITNESS_ALIASES:
         return "witness"
-    return _slug(text)
+    return slugify(text)
 
 
-def _relation_key(relation: str) -> str:
-    text = _normalize(relation)
-    if text in {"heard of", "knew of", "had heard of", "had_heard_of", "know of"}:
-        return "had_heard_of"
-    if text in {"met face to face", "meet face to face", "met_face_to_face"}:
-        return "met_face_to_face"
-    return _slug(text)
+def _relation_key(claim: ExtractedClaim) -> str:
+    return claim.relation_family
 
 
 def _object_key(claim: ExtractedClaim) -> str:
-    text = _normalize(" ".join([claim.object, claim.standalone_claim, claim.evidence]))
-    if not text:
-        return ""
-    if "daniel cho" in text:
-        return "person:daniel_cho"
-    if "victor lane" in text:
-        return "person:victor_lane"
-    if "hargrove" in text and "warehouse" in text:
-        return "place:hargrove_street_warehouse"
-    if "hargrove" in text:
-        return "place:hargrove_street_area"
-    if "honda" in text or "civic" in text:
-        return "vehicle:grey_honda_civic"
-    if "restaurant" in text:
-        return "place:restaurant"
-    if "pharmacy" in text:
-        return "place:pharmacy"
-    if "home" in text or "apartment" in text:
-        return "place:home"
-    if "pizza" in text or "thai food" in text:
-        return "food:ordered_food"
-    if "groceries" in text:
-        return "errand:groceries"
-    if "phone call" in text or "call" in text:
-        return "communication:phone_call"
-    return _slug(claim.object) or _slug(claim.standalone_claim)[:80]
+    return _semantic_key(claim.object) or _semantic_key(claim.location or "") or _fallback_claim_key(claim)
 
 
 def _entity_keys(claim: ExtractedClaim) -> list[str]:
-    text = _normalize(" ".join([claim.topic, claim.object, claim.location or "", claim.standalone_claim, claim.evidence]))
     entities: list[str] = []
 
-    for marker, entity in [
-        ("daniel cho", "person:daniel_cho"),
-        ("victor lane", "person:victor_lane"),
-        ("honda", "vehicle:grey_honda_civic"),
-        ("civic", "vehicle:grey_honda_civic"),
-        ("parking lot", "place:parking_lot"),
-        ("restaurant", "place:restaurant"),
-        ("pharmacy", "place:pharmacy"),
-        ("phone call", "communication:phone_call"),
-    ]:
-        if marker in text and entity not in entities:
-            entities.append(entity)
+    for value in [claim.object, claim.location or ""]:
+        sk = _semantic_key(value)
+        if sk:
+            entities.append(sk)
+        entities.extend(_named_phrase_keys(value))
 
-    if "hargrove" in text:
-        entities.append("place:hargrove_street_warehouse" if "warehouse" in text else "place:hargrove_street_area")
-    if "home" in text or "apartment" in text:
-        entities.append("place:home")
+    for value in [claim.standalone_claim, claim.evidence]:
+        entities.extend(_named_phrase_keys(value))
 
-    object_key = _object_key(claim)
-    if object_key and object_key not in entities and object_key.split(":", 1)[0] in {"person", "place", "vehicle"}:
-        entities.append(object_key)
-
-    return entities
+    return _unique(entities)
 
 
 def _location_key(value: str) -> str:
-    text = _normalize(value)
-    if not text:
-        return ""
-    if "home" in text or "apartment" in text:
-        return "place:home"
-    if "restaurant" in text:
-        return "place:restaurant"
-    if "pharmacy" in text:
-        return "place:pharmacy"
-    if "parking lot" in text:
-        return "place:parking_lot"
-    if "hargrove" in text and "warehouse" in text:
-        return "place:hargrove_street_warehouse"
-    if "hargrove" in text:
-        return "place:hargrove_street_area"
-    return _slug(text)
+    return _semantic_key(value)
 
 
 def _time_bucket(claim: ExtractedClaim) -> str:
     time = claim.time
-    text = _normalize(" ".join([claim.topic, claim.standalone_claim, claim.evidence, time.raw if time else ""]))
-    if "november 3" in text or "nov 3" in text:
-        day = "nov_3"
-    elif "monday" in text:
-        day = "monday"
-    elif "tuesday" in text:
-        day = "tuesday"
-    else:
-        day = ""
+    values = [
+        time.raw if time else "",
+        claim.question_context.time or "",
+        claim.topic,
+        claim.standalone_claim,
+        claim.evidence,
+    ]
+    text = normalize_text(" ".join(values))
+    explicit_parts = _time_parts_from_text(text)
 
-    if "all evening" in text or "whole night" in text or "evening" in text or "night" in text:
-        period = "evening"
-    elif time and time.minutes is not None:
-        period = f"minute_{time.minutes}"
-    else:
-        period = ""
+    if time and time.minutes is not None:
+        explicit_parts.append(f"minute_{time.minutes}")
 
-    return "_".join(part for part in [day, period] if part)
+    return "_".join(_unique(explicit_parts))
 
 
-def _topic_key(claim: ExtractedClaim, entity_keys: list[str], time_bucket: str, location_key: str) -> str:
-    if claim.relation_family == "knowledge" and entity_keys:
-        return f"{entity_keys[0]}_prior_knowledge"
-    if claim.relation_family == "contact":
-        return "contact_with_others"
-    if claim.relation_family == "sleep_time":
-        return "sleep_time"
-    if claim.relation_family in {"location_at_time", "movement"} and (time_bucket or location_key):
-        return "location_movement_context"
-    if claim.relation_family == "ownership":
-        return "vehicle_ownership"
-    return _slug(claim.topic) or claim.relation_family
+def _topic_key(
+    claim: ExtractedClaim,
+    entity_keys: list[str],
+    object_key: str,
+    location_key: str,
+    time_bucket: str,
+) -> str:
+    explicit = _explicit_topic_key(claim)
+    if explicit:
+        return explicit
+
+    anchor = entity_keys[0] if entity_keys else object_key or location_key or time_bucket
+    return "_".join(p for p in _unique([claim.relation_family, anchor]) if p)
 
 
 def _value_key(claim: ExtractedClaim, object_key: str, location_key: str, time_bucket: str) -> str:
-    if claim.relation_family == "location_at_time":
-        return location_key or object_key
-    if claim.relation_family == "sleep_time":
-        return time_bucket or object_key
-    return object_key or location_key or time_bucket
+    required_slots = set(FAMILY_CONSTRAINTS.get(claim.relation_family, {}).get("required_slots", ()))
+    ordered_values = []
+
+    if "location" in required_slots:
+        ordered_values.append(location_key)
+    if "object" in required_slots:
+        ordered_values.append(object_key)
+    if "time" in required_slots:
+        ordered_values.append(time_bucket)
+
+    ordered_values.extend([object_key, location_key, time_bucket])
+    return "_".join(_unique(value for value in ordered_values if value))
 
 
-def _normalize(value: str) -> str:
-    return (
-        value.lower()
-        .replace("_", " ")
-        .replace("“", '"')
-        .replace("”", '"')
-        .replace("—", "-")
-        .replace("–", "-")
-        .replace("didn't", "did not")
-        .replace("don't", "do not")
-        .strip()
-    )
-
-
-def _slug(value: str) -> str:
-    token = ""
-    tokens: list[str] = []
-    for character in _normalize(value):
-        if character.isalnum():
-            token += character
-        elif token:
-            tokens.append(token)
-            token = ""
-    if token:
-        tokens.append(token)
+def _semantic_key(value: str, max_tokens: int | None = None) -> str:
+    tokens = _meaningful_tokens(value)
+    if max_tokens is not None:
+        tokens = tokens[:max_tokens]
     return "_".join(tokens)
 
 
-def _create_chroma_collection() -> Any | None:
-    try:
-        import chromadb  # type: ignore[import-not-found]
-        from chromadb.config import Settings  # type: ignore[import-not-found]
+def _explicit_topic_key(claim: ExtractedClaim) -> str:
+    topic_text = normalize_text(claim.topic)
+    if not topic_text:
+        return ""
+    if topic_text in {normalize_text(claim.standalone_claim), normalize_text(claim.evidence)}:
+        return ""
+    if len(_meaningful_tokens(claim.topic)) > 5:
+        return ""
+    return _semantic_key(claim.topic)
 
-        client = chromadb.Client(Settings(anonymized_telemetry=False, is_persistent=False))
-        return client.create_collection(name=f"claims_{uuid.uuid4().hex}")
-    except Exception as error:
-        debug_log("vector.index", {"path": "memory", "reason": "chromadb_unavailable", "error": str(error)})
-        return None
+
+def _fallback_claim_key(claim: ExtractedClaim) -> str:
+    text = claim.standalone_claim or claim.evidence or claim.topic
+    return "_".join(_meaningful_tokens(text)[:8])
 
 
-def _chroma_safe_metadata(metadata: dict[str, Any]) -> dict[str, str | int | float | bool]:
-    return {key: value if isinstance(value, (str, int, float, bool)) else str(value) for key, value in metadata.items()}
+def _named_phrase_keys(value: str) -> list[str]:
+    keys: list[str] = []
+    for phrase in _capitalized_phrases(value):
+        key = _semantic_key(phrase)
+        if key:
+            keys.append(key)
+
+    for quoted in re.findall(r'"([^"]+)"|' + r"'([^']+)'", value):
+        phrase = quoted[0] or quoted[1]
+        key = _semantic_key(phrase)
+        if key:
+            keys.append(key)
+
+    return keys
+
+
+def _capitalized_phrases(value: str) -> list[str]:
+    return [
+        match.group(0)
+        for match in re.finditer(r"\b(?:[A-Z][a-zA-Z0-9'.-]*)(?:\s+[A-Z][a-zA-Z0-9'.-]*)*\b", value)
+        if _is_named_phrase(match.group(0))
+    ]
+
+
+def _is_named_phrase(value: str) -> bool:
+    text = normalize_text(value)
+    if text in ENTITY_STOPWORDS or text in MONTHS or text in WEEKDAYS or text in PERIOD_WORDS:
+        return False
+    if text in {"am", "pm", "a m", "p m"}:
+        return False
+    return bool(_meaningful_tokens(text))
+
+
+def _time_parts_from_text(text: str) -> list[str]:
+    parts: list[str] = []
+
+    for weekday in WEEKDAYS:
+        if re.search(rf"\b{weekday}\b", text):
+            parts.append(weekday)
+
+    for month in MONTHS:
+        match = re.search(rf"\b{month}\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?(?:,\s*(?P<year>\d{{4}}))?\b", text)
+        if match:
+            parts.append("_".join(part for part in [month, match.group("day"), match.group("year") or ""] if part))
+
+    for match in re.finditer(r"\b(?P<month>\d{1,2})[/-](?P<day>\d{1,2})(?:[/-](?P<year>\d{2,4}))?\b", text):
+        parts.append("_".join(part for part in [match.group("year") or "", match.group("month"), match.group("day")] if part))
+
+    for period in PERIOD_WORDS:
+        if re.search(rf"\b{period}\b", text):
+            parts.append(period)
+
+    if re.search(r"\b(all|whole|entire)\s+(night|evening|morning|afternoon|day)\b", text):
+        parts.append("extended_period")
+
+    return parts
+
+
+def _meaningful_tokens(value: str) -> list[str]:
+    tokens = []
+    for token in re.findall(r"[a-zA-Z0-9]+", normalize_text(value)):
+        if len(token) <= 1 or token in ENTITY_STOPWORDS:
+            continue
+        tokens.append(token)
+    return tokens
+
+
+def _unique(values) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+    return result
 
 
 def _normalize_vector(vector: list[float]) -> list[float]:
@@ -481,11 +468,3 @@ def _cosine_similarity(left: list[float], right: list[float]) -> float:
 
 def _normalize_cosine(value: float) -> float:
     return max(0, min(1, value))
-
-
-def _score_from_chroma_distance(distance: float) -> float:
-    return _normalize_cosine(1 - distance / 2)
-
-
-def _round(value: float) -> float:
-    return round(value * 100) / 100

@@ -1,3 +1,12 @@
+"""
+Research prototype: spaCy-based dependency-parsing pipeline for SVO extraction.
+
+This module is a standalone experiment using en_core_web_sm to extract
+subject-verb-object triples via dependency parsing. It is NOT wired into
+the main contradiction-detection system (which uses LLM-based extraction
+via llm.py). Kept here for reference and potential future integration.
+"""
+
 import re
 import spacy
 from collections.abc import Iterable

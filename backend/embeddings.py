@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass
 from typing import Literal
@@ -10,8 +9,6 @@ import httpx
 from .http import provider_request_error, provider_timeout, timeout_error
 from .logger import debug_log, text_preview, vector_preview
 from .models import ExtractedClaim
-
-LOCAL_VECTOR_SIZE = 384
 
 
 @dataclass
@@ -33,30 +30,6 @@ class EmbeddingResult:
     embeddings: list[ClaimEmbedding]
 
 
-class SimilarityIndex:
-    def __init__(self, embeddings: list[ClaimEmbedding]) -> None:
-        self.vectors = {embedding.claim_id: _normalize_vector(embedding.vector) for embedding in embeddings}
-
-    def similarity(self, left_claim_id: str, right_claim_id: str) -> float:
-        left = self.vectors.get(left_claim_id)
-        right = self.vectors.get(right_claim_id)
-
-        if left is None or right is None:
-            return 0
-
-        return _normalize_cosine(_cosine_similarity(left, right))
-
-    def top_matches(self, left_claim_id: str, candidate_ids: list[str], limit: int) -> list[str]:
-        return [
-            candidate_id
-            for candidate_id, _score in sorted(
-                ((candidate_id, self.similarity(left_claim_id, candidate_id)) for candidate_id in candidate_ids),
-                key=lambda item: item[1],
-                reverse=True,
-            )[:limit]
-        ]
-
-
 async def embed_claims(
     claims: list[ExtractedClaim],
     extra_inputs: list[EmbeddingInput] | None = None,
@@ -74,22 +47,7 @@ async def embed_claims(
     if provider == "openai":
         return await _embed_with_openai(claims, extra_inputs)
 
-    if provider == "ollama":
-        return await _embed_with_ollama(claims, extra_inputs)
-
-    return _embed_locally(claims, provider, extra_inputs)
-
-
-def create_similarity_index(embeddings: list[ClaimEmbedding]) -> SimilarityIndex:
-    return SimilarityIndex(embeddings)
-
-
-def embed_text_locally(text: str) -> list[float]:
-    return _hash_text_to_vector(text)
-
-
-def slot_embedding_id(claim_id: str, slot: Literal["subject", "relation", "object"]) -> str:
-    return f"{claim_id}:{slot}"
+    return await _embed_with_ollama(claims, extra_inputs)
 
 
 def claim_to_embedding_text(claim: ExtractedClaim) -> str:
@@ -100,16 +58,7 @@ def _claim_embedding_inputs(
     claims: list[ExtractedClaim],
     extra_inputs: list[EmbeddingInput] | None = None,
 ) -> list[EmbeddingInput]:
-    inputs: list[EmbeddingInput] = []
-    for claim in claims:
-        inputs.extend(
-            [
-                EmbeddingInput(claim.id, claim_to_embedding_text(claim)),
-                EmbeddingInput(slot_embedding_id(claim.id, "subject"), claim.subject),
-                EmbeddingInput(slot_embedding_id(claim.id, "relation"), claim.relation),
-                EmbeddingInput(slot_embedding_id(claim.id, "object"), claim.object),
-            ]
-        )
+    inputs = [EmbeddingInput(claim.id, claim_to_embedding_text(claim)) for claim in claims]
     if extra_inputs:
         inputs.extend(extra_inputs)
     return inputs
@@ -119,7 +68,7 @@ async def _embed_with_ollama(
     claims: list[ExtractedClaim],
     extra_inputs: list[EmbeddingInput] | None = None,
 ) -> EmbeddingResult:
-    model = os.getenv("OLLAMA_EMBEDDING_MODEL", "embeddinggemma")
+    model = os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text")
     base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
     headers = {"Content-Type": "application/json"}
     inputs = _claim_embedding_inputs(claims, extra_inputs)
@@ -143,6 +92,17 @@ async def _embed_with_ollama(
 
     if embed_response.status_code < 400:
         vectors = embed_response.json().get("embeddings") or []
+        if len(vectors) != len(inputs):
+            debug_log(
+                "embedding.batch_mismatch",
+                {
+                    "provider": "ollama",
+                    "model": model,
+                    "expected": len(inputs),
+                    "received": len(vectors),
+                    "message": "Batch /api/embed returned mismatched vector count; falling back to per-item /api/embeddings.",
+                },
+            )
         if len(vectors) == len(inputs):
             embeddings = [
                 ClaimEmbedding(embedding_input.id, [float(value) for value in vectors[index]])
@@ -218,73 +178,6 @@ async def _embed_with_openai(
     return EmbeddingResult("openai", model, embeddings)
 
 
-def _embed_locally(
-    claims: list[ExtractedClaim],
-    provider: str,
-    extra_inputs: list[EmbeddingInput] | None = None,
-) -> EmbeddingResult:
-    inputs = _claim_embedding_inputs(claims, extra_inputs)
-    model = f"hashed-{LOCAL_VECTOR_SIZE}"
-    embeddings = [
-        ClaimEmbedding(embedding_input.id, _hash_text_to_vector(embedding_input.text))
-        for embedding_input in inputs
-    ]
-
-    _log_embedding_inputs(provider, model, inputs)
-    _log_embedding_vectors(provider, model, "local", embeddings)
-
-    return EmbeddingResult(provider, model, embeddings)
-
-
-def _hash_text_to_vector(text: str) -> list[float]:
-    vector = [0.0] * LOCAL_VECTOR_SIZE
-    tokens = [token for token in _split_tokens(text.lower()) if len(token) > 2]
-
-    for token in tokens:
-        index = _positive_hash(token) % LOCAL_VECTOR_SIZE
-        sign = 1 if _positive_hash(f"{token}:sign") % 2 == 0 else -1
-        vector[index] += sign
-
-    return vector
-
-
-def _split_tokens(text: str) -> list[str]:
-    token = ""
-    tokens: list[str] = []
-    for character in text:
-        if character.isalnum() or character == "'":
-            token += character
-        elif token:
-            tokens.append(token)
-            token = ""
-    if token:
-        tokens.append(token)
-    return tokens
-
-
-def _positive_hash(value: str) -> int:
-    hash_value = 2166136261
-    for character in value:
-        hash_value ^= ord(character)
-        hash_value = (hash_value * 16777619) & 0xFFFFFFFF
-    return hash_value
-
-
-def _normalize_vector(vector: list[float]) -> list[float]:
-    magnitude = math.sqrt(sum(value * value for value in vector))
-    if magnitude == 0:
-        return vector
-    return [value / magnitude for value in vector]
-
-
-def _cosine_similarity(left: list[float], right: list[float]) -> float:
-    return sum(left[index] * right[index] for index in range(min(len(left), len(right))))
-
-
-def _normalize_cosine(value: float) -> float:
-    return max(0, min(1, value))
-
-
 def _log_embedding_inputs(provider: str, model: str, inputs: list[EmbeddingInput]) -> None:
     debug_log(
         "embedding.inputs",
@@ -300,7 +193,7 @@ def _log_embedding_inputs(provider: str, model: str, inputs: list[EmbeddingInput
 def _log_embedding_vectors(
     provider: str,
     model: str,
-    path: Literal["batch", "fallback", "local"],
+    path: Literal["batch", "fallback"],
     embeddings: list[ClaimEmbedding],
 ) -> None:
     debug_log(

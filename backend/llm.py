@@ -1,17 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 from typing import Any
 
-import httpx
-
-from .http import provider_request_error, provider_timeout, timeout_error
+from .llm_client import llm_chat
 from .logger import debug_log
 from .models import ClaimPolarity, ClaimSource, ExtractedClaim
 from .qa import QABlock, split_qa_blocks
-from .relation_frames import normalize_relation_frame
+from .relation_frames import assign_relation_family
 
 
 async def extract_claims(transcript1: str, transcript2: str) -> dict[str, Any]:
@@ -33,19 +32,9 @@ async def extract_claims(transcript1: str, transcript2: str) -> dict[str, Any]:
     first_blocks = split_qa_blocks(transcript1, "first")
     second_blocks = split_qa_blocks(transcript2, "second")
 
-    if provider == "mock":
-        claims = _mock_claims()
-        _log_mock_claims_by_source(claims)
-        return {
-            "provider": provider,
-            "model": "deterministic-fixture",
-            "claims": claims,
-            "blocks": first_blocks + second_blocks,
-            "claimBlocks": {},
-        }
-
-    first = await _extract_claims_for_source(first_blocks, "first", provider)
-    second = await _extract_claims_for_source(second_blocks, "second", provider)
+    first_task = _extract_claims_for_source(first_blocks, "first", provider)
+    second_task = _extract_claims_for_source(second_blocks, "second", provider)
+    first, second = await asyncio.gather(first_task, second_task)
 
     return {
         "provider": provider,
@@ -61,64 +50,52 @@ async def _extract_claims_for_source(
     source: ClaimSource,
     provider: str,
 ) -> dict[str, Any]:
-    claims: list[ExtractedClaim] = []
+    if not blocks:
+        return {"model": "", "claims": [], "claimBlocks": {}}
+
+    prompt = _build_batch_extraction_prompt(blocks)
+    model, raw_text = await llm_chat(prompt, max_tokens=16000, label="extraction")
+
+    all_claims: list[ExtractedClaim] = []
     claim_blocks: dict[str, str] = {}
-    model = ""
 
-    for block in blocks:
-        prompt = _build_extraction_prompt(block)
+    blocks_data = _parse_batch_json(raw_text)
 
-        if provider == "anthropic":
-            raw = await _call_anthropic(prompt)
-        elif provider == "openai":
-            raw = await _call_openai(prompt)
-        elif provider == "deepseek":
-            raw = await _call_deepseek(prompt)
-        elif provider == "ollama":
-            raw = await _call_ollama(prompt)
-        else:
-            raise ValueError(
-                f'Unsupported LLM_PROVIDER "{provider}". Use ollama, anthropic, openai, deepseek, or mock.'
-            )
+    for block_data in blocks_data:
+        block_id = block_data.get("block_id", "")
+        raw_claims = block_data.get("claims", [])
+        if not isinstance(raw_claims, list):
+            raw_claims = []
 
+        matching_block = next((b for b in blocks if b.id == block_id), None)
         block_claims = _normalize_claims(
-            raw["raw_claims"],
+            raw_claims,
             forced_source=source,
-            id_start=len(claims) + 1,
-            evidence_question=block.question,
-            evidence_answer=block.answer,
-            block_id=block.id,
+            evidence_question=matching_block.question if matching_block else "",
+            evidence_answer=matching_block.answer if matching_block else "",
+            block_id=block_id,
         )
         for claim in block_claims:
-            claim_blocks[claim.id] = block.id
+            claim_blocks[claim.id] = block_id
 
-        _log_llm_output(
-            provider,
-            raw["model"],
-            raw["raw_text"],
-            raw["raw_claims"],
-            block_claims,
-            source,
-            block.id,
-        )
+        _log_llm_output(provider, model, raw_text, raw_claims, block_claims, source, block_id)
+        all_claims.extend(block_claims)
 
-        model = raw["model"]
-        claims.extend(block_claims)
-
-    return {"model": model, "claims": claims, "claimBlocks": claim_blocks}
+    return {"model": model, "claims": all_claims, "claimBlocks": claim_blocks}
 
 
-def _build_extraction_prompt(block: QABlock) -> str:
+def _build_batch_extraction_prompt(blocks: list[QABlock]) -> str:
+    blocks_text = "\n\n".join(
+        f"--- Block {block.id} ---\nQ: {block.question}\nA: {block.answer}"
+        for block in blocks
+    )
+
     return f"""
 You are an information extraction system for legal deposition transcripts.
 
-Your task is to extract atomic factual claims from a single Q/A block.
+Your task is to extract atomic factual claims from the Q/A blocks below.
 
-Return valid JSON only. Return exactly one object with one top-level key: "claims".
-
-Input metadata:
-- source: "{block.source}"
-- claim_id_prefix: "{block.source}_{block.id.replace('-', '_')}"
+Return valid JSON only. Return exactly one object with a "blocks" array.
 
 Rules:
 1. Use both the question and the answer.
@@ -130,7 +107,7 @@ Rules:
 7. Preserve time, location, negation, uncertainty, and speaker.
 8. If the answer is vague, mark missing fields as null or "".
 9. If the witness says "I don't know", "I don't remember", or refuses to answer, extract a memory/knowledge claim, not the underlying event.
-10. Evidence.answer must be an exact substring of the answer below.
+10. Evidence.answer must be an exact substring of the block's answer.
 11. Do not classify contradictions.
 12. Prior knowledge rules:
     - "never heard of X" -> relation="had_heard_of", object=X, negation=true.
@@ -140,39 +117,47 @@ Rules:
 
 Output shape:
 {{
-  "claims": [
+  "blocks": [
     {{
-      "claim_id": "{block.source}_{block.id.replace('-', '_')}_claim1",
-      "source": "{block.source}",
-      "speaker": "witness",
-      "standalone_claim": "The witness was at home on the evening of November 3rd.",
-      "subject": "witness",
-      "relation": "was_at",
-      "object": "home",
-      "time": {{
-        "raw": "evening of November 3rd",
-        "normalized24h": null,
-        "minutes": null,
-        "approximate": false
-      }},
-      "location": "home",
-      "negation": false,
-      "certainty": "certain",
-      "question_context": {{
-        "asked_about": "location",
-        "time": "evening of November 3rd",
-        "location": null
-      }},
-      "evidence": {{
-        "question": "{block.question}",
-        "answer": "exact quote from the answer"
-      }}
+      "block_id": "first-block-1",
+      "claims": [
+        {{
+          "claim_id": "first_block1_claim1",
+          "source": "{blocks[0].source}",
+          "speaker": "witness",
+          "topic": "short label summarizing the factual topic",
+          "relation_family": "location_at_time",
+          "standalone_claim": "The witness was at home on the evening of November 3rd.",
+          "subject": "witness",
+          "relation": "was_at",
+          "object": "home",
+          "time": {{
+            "raw": "evening of November 3rd",
+            "normalized24h": null,
+            "minutes": null,
+            "approximate": false
+          }},
+          "location": "home",
+          "negation": false,
+          "certainty": "certain",
+          "question_context": {{
+            "asked_about": "location",
+            "time": "evening of November 3rd",
+            "location": null
+          }},
+          "evidence": {{
+            "question": "Where were you on the evening of November 3rd?",
+            "answer": "exact quote from the answer"
+          }}
+        }}
+      ]
     }}
   ]
 }}
 
 Allowed values:
 - certainty: "certain", "uncertain", "denied", "unknown", or "does_not_remember"
+- relation_family: "movement", "sleep_time", "ownership", "knowledge", "contact", "location_at_time", "action", or "unknown"
 - time.normalized24h: "HH:MM", "24:00", or null
 - time.minutes: integer from 0 to 1440, or null
 - time.approximate: true or false
@@ -189,210 +174,29 @@ Time normalization rules:
 - If raw contains "around", "about", "maybe", "I think", mark approximate as true.
 - Every time object must include raw, normalized24h, minutes, and approximate.
 
-Q/A block:
-Q: {block.question}
-A: {block.answer}
+Q/A blocks:
+{blocks_text}
 """.strip()
 
 
-async def _call_ollama(prompt: str) -> dict[str, Any]:
-    model = os.getenv("OLLAMA_MODEL", "llama3.2")
-    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-    headers = {"Content-Type": "application/json"}
-
-    if os.getenv("OLLAMA_API_KEY"):
-        headers["Authorization"] = f"Bearer {os.environ['OLLAMA_API_KEY']}"
-
-    try:
-        async with httpx.AsyncClient(timeout=provider_timeout()) as client:
-            response = await client.post(
-                f"{base_url}/api/chat",
-                headers=headers,
-                json={
-                    "model": model,
-                    "stream": False,
-                    "format": "json",
-                    "options": {
-                        "temperature": 0,
-                        "top_p": 0.1,
-                        "num_predict": 2400,
-                    },
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You output strict JSON only. "
-                                "Return one object with one claims array. "
-                                "Do not repeat JSON keys."
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-            )
-    except httpx.TimeoutException as error:
-        raise timeout_error("Ollama", model) from error
-    except httpx.RequestError as error:
-        raise provider_request_error("Ollama", model, error) from error
-
-    if response.status_code >= 400:
-        raise ValueError(f"Ollama request failed: {response.status_code} {response.text}")
-
-    raw_text = response.json().get("message", {}).get("content", "")
-    raw_claims = _parse_claims_json(raw_text)
-
-    return {"model": model, "raw_text": raw_text, "raw_claims": raw_claims}
-
-
-async def _call_anthropic(prompt: str) -> dict[str, Any]:
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
-
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY is required when LLM_PROVIDER=anthropic.")
-
-    try:
-        async with httpx.AsyncClient(timeout=provider_timeout()) as client:
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "Content-Type": "application/json",
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                },
-                json={
-                    "model": model,
-                    "max_tokens": 2400,
-                    "temperature": 0,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-            )
-    except httpx.TimeoutException as error:
-        raise timeout_error("Anthropic", model) from error
-    except httpx.RequestError as error:
-        raise provider_request_error("Anthropic", model, error) from error
-
-    if response.status_code >= 400:
-        raise ValueError(f"Anthropic request failed: {response.status_code} {response.text}")
-
-    raw_text = (response.json().get("content") or [{}])[0].get("text", "")
-    raw_claims = _parse_claims_json(raw_text)
-
-    return {"model": model, "raw_text": raw_text, "raw_claims": raw_claims}
-
-
-async def _call_openai(prompt: str) -> dict[str, Any]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1")
-
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai.")
-
-    try:
-        async with httpx.AsyncClient(timeout=provider_timeout()) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                },
-                json={
-                    "model": model,
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You output strict JSON only. "
-                                "Return one object with one claims array. "
-                                "Do not repeat JSON keys."
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-            )
-    except httpx.TimeoutException as error:
-        raise timeout_error("OpenAI", model) from error
-    except httpx.RequestError as error:
-        raise provider_request_error("OpenAI", model, error) from error
-
-    if response.status_code >= 400:
-        raise ValueError(f"OpenAI request failed: {response.status_code} {response.text}")
-
-    raw_text = (response.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
-    raw_claims = _parse_claims_json(raw_text)
-
-    return {"model": model, "raw_text": raw_text, "raw_claims": raw_claims}
-
-
-async def _call_deepseek(prompt: str) -> dict[str, Any]:
-    api_key = os.getenv("DEEPSEEK_API_KEY")
-    model = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-    base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-
-    if not api_key:
-        raise ValueError("DEEPSEEK_API_KEY is required when LLM_PROVIDER=deepseek.")
-
-    try:
-        async with httpx.AsyncClient(timeout=provider_timeout()) as client:
-            response = await client.post(
-                f"{base_url}/chat/completions",
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {api_key}",
-                },
-                json={
-                    "model": model,
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You output strict JSON only. "
-                                "Return one object with one claims array. "
-                                "Do not repeat JSON keys."
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-            )
-    except httpx.TimeoutException as error:
-        raise timeout_error("DeepSeek", model) from error
-    except httpx.RequestError as error:
-        raise provider_request_error("DeepSeek", model, error) from error
-
-    if response.status_code >= 400:
-        raise ValueError(f"DeepSeek request failed: {response.status_code} {response.text}")
-
-    raw_text = (response.json().get("choices") or [{}])[0].get("message", {}).get("content", "")
-    raw_claims = _parse_claims_json(raw_text)
-
-    return {"model": model, "raw_text": raw_text, "raw_claims": raw_claims}
-
-
-def _parse_claims_json(text: str) -> list[dict[str, Any]]:
+def _parse_batch_json(text: str) -> list[dict[str, Any]]:
     json_text = _extract_json_object_text(text)
-
     if not json_text:
         raise ValueError("LLM response did not contain JSON.")
 
     parsed = json.loads(json_text, object_pairs_hook=_merge_duplicate_claims_keys)
 
     if isinstance(parsed, list):
-        claims = parsed
+        blocks = parsed
     elif isinstance(parsed, dict):
-        claims = parsed.get("claims")
+        blocks = parsed.get("blocks", [])
     else:
-        claims = None
+        blocks = []
 
-    if not isinstance(claims, list):
-        raise ValueError("LLM JSON must contain a claims array.")
+    if not isinstance(blocks, list):
+        raise ValueError("LLM JSON must contain a blocks array.")
 
-    return [claim for claim in claims if isinstance(claim, dict)]
+    return [block for block in blocks if isinstance(block, dict)]
 
 
 def _extract_json_object_text(text: str) -> str:
@@ -442,7 +246,6 @@ def _merge_duplicate_claims_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]
 def _normalize_claims(
     raw_claims: list[dict[str, Any]],
     forced_source: ClaimSource | None = None,
-    id_start: int = 1,
     evidence_question: str | None = None,
     evidence_answer: str | None = None,
     block_id: str | None = None,
@@ -467,14 +270,11 @@ def _normalize_claims(
             normalized["evidenceDetail"]["answer"] = repaired_evidence
 
         source: ClaimSource = forced_source or ("second" if normalized["source"] == "second" else "first")
-        relation_frame = normalize_relation_frame(
-            normalized["relation"],
-            normalized["object"],
-            normalized["evidence"],
-            normalized["location"],
-        )
         claim_id = _claim_id_for_block(source, block_id, len(claims) + 1)
         polarity = _normalize_polarity(normalized["polarity"], normalized)
+
+        family = _normalize_family(normalized.get("relationFamily", ""))
+        frame = assign_relation_family(normalized["relation"], family)
 
         claim = ExtractedClaim(
             id=claim_id,
@@ -483,8 +283,8 @@ def _normalize_claims(
             speaker=normalized["speaker"],
             topic=normalized["topic"],
             subject=normalized["subject"],
-            relation=relation_frame.relation,
-            relationFamily=relation_frame.family,
+            relation=frame.relation,
+            relationFamily=frame.family,
             object=normalized["object"],
             polarity=polarity,
             negation=polarity == "negated",
@@ -512,6 +312,7 @@ def _normalize_raw_claim(
     source = "second" if source == "second" else "first"
 
     topic = _clean(raw_claim.get("topic"))
+    relation_family = _clean(raw_claim.get("relation_family") or raw_claim.get("relationFamily"))
     standalone_claim = _clean(raw_claim.get("standalone_claim") or raw_claim.get("standaloneClaim"))
     speaker = _clean(raw_claim.get("speaker")) or "witness"
     subject = _clean(raw_claim.get("subject"))
@@ -540,21 +341,6 @@ def _normalize_raw_claim(
         location,
     )
 
-    if not subject:
-        subject = _guess_subject_from_claim(topic, relation, obj, evidence)
-
-    if not obj:
-        obj = _guess_object_from_claim(relation, evidence, location)
-
-    if not location:
-        location = _guess_location_from_claim(relation, obj, evidence)
-
-    if not topic:
-        topic = _guess_topic_from_claim(relation, obj, location, evidence)
-
-    if not relation:
-        relation = _guess_relation_from_evidence(evidence)
-
     if not standalone_claim:
         standalone_claim = _build_standalone_claim(subject, relation, obj, normalized_time, location, negation, evidence)
 
@@ -566,6 +352,7 @@ def _normalize_raw_claim(
         "subject": subject,
         "relation": relation,
         "object": obj,
+        "relationFamily": relation_family,
         "polarity": raw_claim.get("polarity") or ("negated" if negation else "affirmed"),
         "negation": negation,
         "certainty": certainty,
@@ -584,6 +371,17 @@ def _claim_id_for_block(source: ClaimSource, block_id: str | None, fallback_numb
         if match:
             return f"{source}_block{match.group('number')}_claim{fallback_number}"
     return f"{source}_claim{fallback_number}"
+
+
+def _normalize_family(value: str) -> str:
+    valid = {
+        "movement", "sleep_time", "ownership", "knowledge", "contact",
+        "location_at_time", "action", "unknown",
+    }
+    text = value.strip().lower().replace("_", " ").replace(" ", "_")
+    if text in valid:
+        return text
+    return "unknown"
 
 
 def _normalize_evidence_detail(value: Any, fallback_question: str) -> dict[str, str]:
@@ -822,150 +620,9 @@ def _minutes_from_24h(value: str) -> int | None:
     return hour * 60 + minute
 
 
-def _guess_subject_from_claim(topic: str, relation: str, obj: str, evidence: str) -> str:
-    text = " ".join([topic, relation, obj, evidence]).lower()
-
-    if re.search(r"\b(i|me|my|we|witness|marcus webb)\b", text):
-        return "witness"
-
-    return ""
-
-
-def _guess_object_from_claim(relation: str, evidence: str, location: str) -> str:
-    lower_relation = relation.lower()
-    lower_evidence = evidence.lower()
-
-    if "daniel cho" in lower_evidence:
-        return "Daniel Cho"
-
-    if "victor lane" in lower_evidence:
-        return "Victor Lane"
-
-    if location and any(term in lower_relation for term in ["was at", "stayed", "located"]):
-        return location
-
-    if "hargrove street warehouse" in lower_evidence:
-        return "Hargrove Street warehouse"
-
-    if "hargrove street" in lower_evidence:
-        return "Hargrove Street"
-
-    if "home" in lower_evidence:
-        return "home"
-
-    if "groceries" in lower_evidence:
-        return "groceries"
-
-    if "pizza" in lower_evidence:
-        return "pizza"
-
-    if "restaurant" in lower_evidence:
-        return "restaurant"
-
-    if "pharmacy" in lower_evidence:
-        return "pharmacy"
-
-    if "phone call" in lower_evidence or "called" in lower_evidence:
-        return "phone call"
-
-    return ""
-
-
-def _guess_location_from_claim(relation: str, obj: str, evidence: str) -> str:
-    text = " ".join([relation, obj, evidence]).lower()
-
-    if "home" in text:
-        return "home"
-
-    if "parking lot" in text:
-        return "parking lot"
-
-    if "hargrove street warehouse" in text:
-        return "Hargrove Street warehouse"
-
-    if "hargrove street" in text:
-        return "Hargrove Street"
-
-    return ""
-
-
-def _guess_topic_from_claim(relation: str, obj: str, location: str, evidence: str) -> str:
-    text = " ".join([relation, obj, location, evidence]).lower()
-
-    if "victor lane" in text:
-        return "Victor Lane prior knowledge"
-
-    if any(term in text for term in ["daniel cho", "heard of", "knew of", "mutual friends"]):
-        return "Daniel Cho prior knowledge"
-
-    if any(term in text for term in ["sleep", "midnight"]):
-        return "sleep time"
-
-    if any(term in text for term in ["home", "apartment", "restaurant", "pharmacy", "parking lot", "warehouse", "hargrove", "went out", "went to", "left", "drove", "driven"]):
-        return "location movement"
-
-    if any(term in text for term in ["owned", "sold", "civic", "car"]):
-        return "vehicle ownership"
-
-    if any(term in text for term in ["waved", "seen", "neighbor", "tom", "met", "spoke", "phone call", "called"]):
-        return "contact"
-
-    return "general fact"
-
-
-def _guess_relation_from_evidence(evidence: str) -> str:
-    text = evidence.lower()
-
-    if "met" in text and "face to face" in text:
-        return "met_face_to_face"
-
-    if "went to sleep" in text or "midnight" in text:
-        return "went to sleep"
-
-    if "went out" in text:
-        return "went out"
-
-    if "went to" in text:
-        return "went to"
-
-    if "was at home" in text:
-        return "was at"
-
-    if "was at my apartment" in text or "was at apartment" in text:
-        return "was at"
-
-    if "phone call" in text or "called" in text:
-        return "called"
-
-    if "ordered" in text:
-        return "ordered"
-
-    if "watched" in text:
-        return "watched"
-
-    if "sold" in text:
-        return "sold"
-
-    if "owned" in text or "did at the time" in text:
-        return "owned"
-
-    if "knew of" in text or "heard of" in text or "mutual friends" in text:
-        return "had_heard_of"
-
-    if "driven through" in text:
-        return "driven through"
-
-    if "waved" in text:
-        return "waved"
-
-    return ""
-
 
 def _is_usable_claim(claim: ExtractedClaim) -> bool:
     if not claim.evidence:
-        return False
-
-    if not claim.topic:
         return False
 
     if not claim.relation:
@@ -1121,160 +778,4 @@ def _log_triples(provider: str, model: str, claims: list[ExtractedClaim]) -> Non
     )
 
 
-def _log_mock_claims_by_source(claims: list[ExtractedClaim]) -> None:
-    for source in ["first", "second"]:
-        typed_source: ClaimSource = "second" if source == "second" else "first"
-        source_claims = [claim for claim in claims if claim.source == source]
-        raw_text = json.dumps(
-            {
-                "claims": [
-                    claim.model_dump(by_alias=True, exclude_none=True)
-                    for claim in source_claims
-                ]
-            }
-        )
-        _log_llm_output(
-            "mock",
-            "deterministic-fixture",
-            raw_text,
-            [
-                claim.model_dump(by_alias=True, exclude_none=True)
-                for claim in source_claims
-            ],
-            source_claims,
-            typed_source,
-        )
 
-
-def _mock_claims() -> list[ExtractedClaim]:
-    return _normalize_claims(
-        [
-            {
-                "source": "first",
-                "topic": "location evening november 3",
-                "subject": "Marcus Webb",
-                "relation": "stayed home all evening",
-                "object": "home",
-                "polarity": "affirmed",
-                "location": "home",
-                "evidence": "I was at home all evening.",
-            },
-            {
-                "source": "first",
-                "topic": "food evening november 3",
-                "subject": "Marcus Webb",
-                "relation": "ordered",
-                "object": "pizza around 7pm",
-                "polarity": "affirmed",
-                "time": {
-                    "raw": "around 7pm",
-                    "normalized24h": "19:00",
-                    "approximate": True,
-                },
-                "uncertaintyMarkers": ["around"],
-                "evidence": "I ordered pizza around 7pm and watched TV.",
-            },
-            {
-                "source": "first",
-                "topic": "contact evening november 3",
-                "subject": "Marcus Webb",
-                "relation": "spoke to anyone",
-                "object": "no one",
-                "polarity": "negated",
-                "evidence": "No, I was alone.",
-            },
-            {
-                "source": "first",
-                "topic": "sleep evening november 3",
-                "subject": "Marcus Webb",
-                "relation": "went to sleep",
-                "object": "around 10 maybe 10:30",
-                "polarity": "affirmed",
-                "time": {
-                    "raw": "Around 10, maybe 10:30",
-                    "normalized24h": "22:00",
-                    "approximate": True,
-                },
-                "uncertaintyMarkers": ["around", "maybe"],
-                "evidence": "Around 10, maybe 10:30.",
-            },
-            {
-                "source": "first",
-                "topic": "warehouse prior visits",
-                "subject": "Marcus Webb",
-                "relation": "been to Hargrove Street warehouse",
-                "object": "never",
-                "polarity": "negated",
-                "location": "Hargrove Street warehouse",
-                "evidence": "No, never. I don't even know where that is.",
-            },
-            {
-                "source": "first",
-                "topic": "Daniel Cho prior knowledge",
-                "subject": "Marcus Webb",
-                "relation": "had_heard_of",
-                "object": "Daniel Cho",
-                "polarity": "negated",
-                "evidence": "I'd never heard of him before this whole thing started.",
-            },
-            {
-                "source": "second",
-                "topic": "location evening november 3",
-                "subject": "Marcus Webb",
-                "relation": "went out briefly",
-                "object": "groceries",
-                "polarity": "affirmed",
-                "time": {
-                    "raw": "maybe around 7:30",
-                    "normalized24h": "19:30",
-                    "approximate": True,
-                },
-                "uncertaintyMarkers": ["think", "maybe", "around"],
-                "evidence": "I think I went out briefly to get some groceries, maybe around 7:30.",
-            },
-            {
-                "source": "second",
-                "topic": "contact evening november 3",
-                "subject": "Marcus Webb",
-                "relation": "was seen by neighbor",
-                "object": "waved in parking lot",
-                "polarity": "affirmed",
-                "uncertaintyMarkers": ["might"],
-                "evidence": "My neighbor, Tom, might have seen me. We waved or something in the parking lot.",
-            },
-            {
-                "source": "second",
-                "topic": "sleep evening november 3",
-                "subject": "Marcus Webb",
-                "relation": "went to sleep",
-                "object": "midnight maybe",
-                "polarity": "affirmed",
-                "time": {
-                    "raw": "Midnight maybe",
-                    "normalized24h": "24:00",
-                    "approximate": True,
-                },
-                "uncertaintyMarkers": ["maybe"],
-                "evidence": "It was late. Midnight maybe.",
-            },
-            {
-                "source": "second",
-                "topic": "warehouse prior visits",
-                "subject": "Marcus Webb",
-                "relation": "visited Hargrove Street area",
-                "object": "driven through that part of town",
-                "polarity": "affirmed",
-                "location": "Hargrove Street area",
-                "evidence": "I've driven through that part of town.",
-            },
-            {
-                "source": "second",
-                "topic": "Daniel Cho prior knowledge",
-                "subject": "Marcus Webb",
-                "relation": "had_heard_of",
-                "object": "Daniel Cho",
-                "polarity": "affirmed",
-                "evidence": "I knew of him. We had mutual friends.",
-            },
-        ]
-    )

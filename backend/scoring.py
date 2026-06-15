@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from .embeddings import ClaimEmbedding
-from .llm_classifier import ClaimPairClassification, classify_claim_pair_with_llm
+from .text_utils import clamp, normalize_text, round_score
 from .logger import debug_log
+from .llm_classifier import ClaimPairClassification, classify_claim_pair_with_llm
 from .models import ClaimPairScore, ContradictionType, ExtractedClaim, Severity
-from .vector_store import CandidatePair, InMemoryClaimVectorStore, frame_for_claim, index_claims, retrieve_candidate_pairs
+from .vector_store import CandidatePair, ClaimFrame, InMemoryClaimVectorStore, frame_for_claim, index_claims, retrieve_candidate_pairs
 
 HEDGE_MARKERS = {
     "about",
@@ -42,6 +43,26 @@ TOP_K_CANDIDATES = 5
 LOW_CONFIDENCE_THRESHOLD = 0.60
 LOW_CONFIDENCE_FALSE_POSITIVE_DISPLAY_THRESHOLD = 0.20
 
+_nli_model: Any = None
+NLI_LABELS = ["contradiction", "entailment", "neutral"]
+
+
+def _get_nli_model() -> Any:
+    global _nli_model
+    if _nli_model is None:
+        from sentence_transformers import CrossEncoder
+
+        _nli_model = CrossEncoder("cross-encoder/nli-deberta-v3-base")
+    return _nli_model
+
+
+def _batch_nli_scores(pairs: list[tuple[str, str]]) -> list[float]:
+    if not pairs:
+        return []
+    model = _get_nli_model()
+    scores = model.predict(pairs, apply_softmax=True)
+    return [float(s[0]) for s in scores]
+
 
 @dataclass(frozen=True)
 class FastGuardrailResult:
@@ -66,7 +87,18 @@ async def score_contradictions(
         top_k=TOP_K_CANDIDATES,
     )
 
+    nli_inputs: list[tuple[str, str]] = []
+    for pair in candidate_pairs:
+        if _apply_fast_guardrails(pair) is None:
+            nli_inputs.append((
+                pair.claim1.standalone_claim,
+                pair.claim2.standalone_claim,
+            ))
+
+    nli_scores = _batch_nli_scores(nli_inputs)
+
     results: list[ClaimPairScore] = []
+    nli_idx = 0
 
     for pair in candidate_pairs:
         fast_guardrail = _apply_fast_guardrails(pair)
@@ -78,12 +110,15 @@ async def score_contradictions(
                 results.append(result)
             continue
 
+        nli_contradiction = nli_scores[nli_idx]
+        nli_idx += 1
+
         llm_result = await classify_claim_pair_with_llm(
             pair.claim1,
             pair.claim2,
             pair.semantic_score,
         )
-        final_result = _apply_post_llm_guardrails(pair, llm_result)
+        final_result = _apply_post_llm_guardrails(pair, llm_result, nli_contradiction)
         _log_final(pair, llm_result, final_result)
 
         if _should_emit(final_result):
@@ -138,7 +173,61 @@ def _apply_fast_guardrails(
             ),
         )
 
+    location_knowledge = _check_location_knowledge_contradiction(claim1, claim2, frame1, frame2)
+    if location_knowledge:
+        return location_knowledge
+
     return None
+
+
+def _check_location_knowledge_contradiction(
+    claim1: ExtractedClaim,
+    claim2: ExtractedClaim,
+    frame1: ClaimFrame,
+    frame2: ClaimFrame,
+) -> FastGuardrailResult | None:
+    candidates = [
+        (claim1, claim2, frame1, frame2),
+        (claim2, claim1, frame2, frame1),
+    ]
+
+    for neg_claim, aff_claim, neg_frame, aff_frame in candidates:
+        if not (
+            neg_claim.relation_family == "knowledge"
+            and neg_claim.negation
+            and aff_claim.relation_family in {"movement", "location_at_time"}
+            and not aff_claim.negation
+        ):
+            continue
+
+        if not neg_frame.location_key or not aff_frame.location_key:
+            continue
+
+        if _locations_related(neg_frame.location_key, aff_frame.location_key):
+            return FastGuardrailResult(
+                type="INFERENTIAL",
+                confidence=0.82,
+                fr=0.72,
+                guardrail="knowledge_vs_presence",
+                rationale=(
+                    "Guardrail: one claim denies knowledge of a location while the other "
+                    "asserts presence or movement in a related location. These cannot "
+                    "reasonably coexist."
+                ),
+            )
+
+    return None
+
+
+def _locations_related(loc_a: str, loc_b: str) -> bool:
+    if loc_a == loc_b:
+        return True
+    if loc_a in loc_b or loc_b in loc_a:
+        return True
+    tokens_a = set(loc_a.split("_"))
+    tokens_b = set(loc_b.split("_"))
+    common = tokens_a & tokens_b - {"place", "person", "vehicle", "area", "warehouse"}
+    return len(common) >= 1
 
 
 def _non_emit_guardrail(guardrail: str, rationale: str) -> FastGuardrailResult:
@@ -154,6 +243,7 @@ def _non_emit_guardrail(guardrail: str, rationale: str) -> FastGuardrailResult:
 def _apply_post_llm_guardrails(
     pair: CandidatePair,
     llm_result: ClaimPairClassification,
+    nli_contradiction: float = 0.0,
 ) -> ClaimPairScore:
     claim1 = pair.claim1
     claim2 = pair.claim2
@@ -177,11 +267,15 @@ def _apply_post_llm_guardrails(
             "Post-LLM guardrail: same normalized fact with opposite polarity. "
             f"Classifier rationale: {llm_result.rationale}"
         )
-    elif llm_result.compatibility in {"compatible", "uncertain"}:
+    elif (
+        llm_result.type in {"DIRECT", "INFERENTIAL"}
+        and llm_result.compatibility in {"compatible", "uncertain"}
+    ):
         final_type = "FALSE_POSITIVE"
         guardrail_name = "post_low_confidence_or_compatible"
         rationale = (
-            "Post-LLM guardrail: classifier found the pair compatible or uncertain. "
+            "Post-LLM guardrail: classifier found a contradiction but assessed "
+            "compatibility as compatible or uncertain. "
             f"Classifier rationale: {llm_result.rationale}"
         )
 
@@ -198,20 +292,20 @@ def _apply_post_llm_guardrails(
             },
         )
 
-    components = _score_components(pair, final_type, llm_result.compatibility)
+    components = _score_components(pair, final_type, llm_result.compatibility, nli_contradiction)
     confidence = components["final"]
     fr = _fr_for_type(final_type, confidence)
     fu = _uncertainty_difference(claim1, claim2)
 
     return ClaimPairScore(
-        fr=_round(fr),
-        fu=_round(fu),
-        confidence=_round(confidence),
-        topicScore=_round(pair.semantic_score),
-        semanticSimilarity=_round(components["semantic"]),
-        nliContradictionScore=_round(components["nli"]),
-        structuredMismatchScore=_round(components["structured"]),
-        finalContradictionScore=_round(components["final"]),
+        fr=round_score(fr),
+        fu=round_score(fu),
+        confidence=round_score(confidence),
+        topicScore=round_score(pair.semantic_score),
+        semanticSimilarity=round_score(components["semantic"]),
+        nliContradictionScore=round_score(components["nli"]),
+        structuredMismatchScore=round_score(components["structured"]),
+        finalContradictionScore=round_score(components["final"]),
         type=final_type,
         severity=_classify_severity(final_type, confidence),
         rationale=rationale,
@@ -233,14 +327,14 @@ def _build_result_from_guardrail(
     fr = _fr_for_type(guardrail.type, confidence)
 
     return ClaimPairScore(
-        fr=_round(fr),
-        fu=_round(fu),
-        confidence=_round(confidence),
-        topicScore=_round(pair.semantic_score),
-        semanticSimilarity=_round(components["semantic"]),
-        nliContradictionScore=_round(components["nli"]),
-        structuredMismatchScore=_round(components["structured"]),
-        finalContradictionScore=_round(components["final"]),
+        fr=round_score(fr),
+        fu=round_score(fu),
+        confidence=round_score(confidence),
+        topicScore=round_score(pair.semantic_score),
+        semanticSimilarity=round_score(components["semantic"]),
+        nliContradictionScore=round_score(components["nli"]),
+        structuredMismatchScore=round_score(components["structured"]),
+        finalContradictionScore=round_score(components["final"]),
         type=guardrail.type,
         severity=_classify_severity(guardrail.type, confidence),
         rationale=guardrail.rationale,
@@ -253,11 +347,16 @@ def _score_components(
     pair: CandidatePair,
     contradiction_type: ContradictionType,
     compatibility: Literal["compatible", "incompatible", "uncertain"],
+    nli_score: float | None = None,
 ) -> dict[str, float]:
-    semantic = _clamp(pair.semantic_score)
-    nli = _nli_contradiction_score(contradiction_type, compatibility)
+    semantic = clamp(pair.semantic_score)
+    nli = nli_score if nli_score is not None else _nli_contradiction_score(contradiction_type, compatibility)
     structured = _structured_mismatch_score(pair)
-    final = _clamp(0.25 * semantic + 0.50 * nli + 0.25 * structured)
+    base = clamp(0.25 * semantic + 0.50 * nli + 0.25 * structured)
+
+    uncertainty_penalty = _average_uncertainty_penalty(pair.claim1, pair.claim2)
+    final = clamp(base * (1 - 0.3 * uncertainty_penalty))
+
     return {
         "semantic": semantic,
         "nli": nli,
@@ -378,12 +477,12 @@ def _classify_severity(
 
 def _certainty_from_claim(claim: ExtractedClaim) -> float:
     text = _claim_text(claim)
-    markers = [_normalize(marker) for marker in claim.uncertainty_markers] + _tokenize(text)
+    markers = [normalize_text(marker) for marker in claim.uncertainty_markers] + _tokenize(text)
     hedge_count = sum(1 for marker in markers if marker in HEDGE_MARKERS)
     direct_count = sum(1 for marker in markers if marker in DIRECT_NEGATIONS)
     approximate_time = bool(claim.time and claim.time.approximate)
     certainty = 0.78 + direct_count * 0.08 - hedge_count * 0.16 - (0.08 if approximate_time else 0)
-    return _clamp(certainty, 0.22, 0.98)
+    return clamp(certainty, 0.22, 0.98)
 
 
 def _uncertainty_difference(claim1: ExtractedClaim, claim2: ExtractedClaim) -> float:
@@ -403,7 +502,7 @@ def _has_same_known_polarity(claim1: ExtractedClaim, claim2: ExtractedClaim) -> 
 
 
 def _claim_text(claim: ExtractedClaim) -> str:
-    return _normalize(
+    return normalize_text(
         " ".join(
             [
                 claim.topic,
@@ -423,7 +522,7 @@ def _claim_text(claim: ExtractedClaim) -> str:
 def _tokenize(text: str) -> list[str]:
     tokens: list[str] = []
     token = ""
-    for character in _normalize(text):
+    for character in normalize_text(text):
         if character.isalnum() or character == "'":
             token += character
         elif token:
@@ -435,23 +534,6 @@ def _tokenize(text: str) -> list[str]:
     return tokens
 
 
-def _normalize(value: str) -> str:
-    return (
-        value.lower()
-        .replace("“", '"')
-        .replace("”", '"')
-        .replace("—", "-")
-        .replace("–", "-")
-        .strip()
-    )
-
-
-def _clamp(value: float, minimum: float = 0, maximum: float = 1) -> float:
-    return min(maximum, max(minimum, value))
-
-
-def _round(value: float) -> float:
-    return round(value * 100) / 100
 
 
 def _log_guardrail(pair: CandidatePair, guardrail: str, result: ClaimPairScore) -> None:

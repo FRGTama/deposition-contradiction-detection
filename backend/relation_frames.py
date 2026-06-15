@@ -1,9 +1,22 @@
 from __future__ import annotations
 
-import re
+import json
 from dataclasses import dataclass
 
+from .llm_client import llm_chat
 from .models import RelationFamily
+from .text_utils import slugify
+
+_FAMILIES = [
+    "movement",
+    "sleep_time",
+    "ownership",
+    "knowledge",
+    "contact",
+    "location_at_time",
+    "action",
+    "unknown",
+]
 
 
 @dataclass(frozen=True)
@@ -50,47 +63,40 @@ FAMILY_CONSTRAINTS: dict[RelationFamily, dict[str, object]] = {
 }
 
 
+async def classify_relation_frames(items: list[dict]) -> list[RelationFamily]:
+    if not items:
+        return []
+
+    prompt = _build_classify_prompt(items)
+    _, raw_text = await llm_chat(prompt, max_tokens=400, label="relation-classifier")
+
+    try:
+        parsed = json.loads(_extract_json(raw_text))
+        families = parsed.get("families") if isinstance(parsed, dict) else parsed
+        if isinstance(families, list):
+            result: list[RelationFamily] = []
+            for entry in families[: len(items)]:
+                family = _normalize_family(entry.get("family") if isinstance(entry, dict) else entry)
+                result.append(family)
+            while len(result) < len(items):
+                result.append("unknown")
+            return result
+    except (json.JSONDecodeError, TypeError, KeyError):
+        pass
+
+    return ["unknown"] * len(items)
+
+
 def normalize_relation_frame(relation: str, obj: str = "", evidence: str = "", location: str = "") -> RelationFrame:
-    text = _normalize(" ".join([relation, obj, evidence, location]))
+    return _frame(slugify(relation) or "unknown", "unknown")
 
-    if _contains_any(text, ["sleep", "slept", "went to sleep", "bed", "midnight"]):
-        return _frame("went_to_sleep", "sleep_time")
 
-    if _contains_any(text, ["went out", "go out", "left", "leave", "stepped out", "went to", "go to", "restaurant", "pharmacy"]):
-        return _frame("went_out", "movement")
-
-    if _contains_any(text, ["drive", "drove", "driven", "arrive", "arrived", "visited", "visit", "been to", "warehouse", "hargrove"]):
-        return _frame("traveled_to", "movement")
-
-    if _contains_any(text, ["sold", "sell", "transferred", "gave"]):
-        return _frame("transferred_ownership", "action")
-
-    if _contains_any(text, ["own", "owned", "possess", "possessed", "belong", "civic", "car"]):
-        return _frame("owned", "ownership")
-
-    if _contains_any(text, ["never heard", "had heard of", "heard of", "knew of", "know of", "aware", "recognize", "recognized", "mutual friends"]):
-        return _frame("had_heard_of", "knowledge")
-
-    if _contains_any(text, ["met face to face", "meet face to face", "face to face"]):
-        return _frame("met_face_to_face", "contact")
-
-    if _contains_any(text, ["met face", "meet face", "met", "meet"]):
-        return _frame("met", "contact")
-
-    if _contains_any(text, ["spoke", "speak", "called", "call", "phone call", "text", "contact", "waved", "seen", "saw", "neighbor"]):
-        return _frame("had_contact", "contact")
-
-    if _contains_any(text, ["was at", "were at", "stayed", "remained", "located", "at home", "at apartment", "home all evening", "all evening", "whole night"]):
-        return _frame("was_at", "location_at_time")
-
-    if _contains_any(text, ["ordered", "watched", "worked", "bought", "purchased"]):
-        return _frame(_snake_relation(relation) or "performed_action", "action")
-
-    return _frame(_snake_relation(relation) or "unknown", "unknown")
+def assign_relation_family(relation: str, family: RelationFamily) -> RelationFrame:
+    return _frame(slugify(relation) or "unknown", family)
 
 
 def relation_family(relation: str, obj: str = "", evidence: str = "", location: str = "") -> RelationFamily:
-    return normalize_relation_frame(relation, obj, evidence, location).family
+    return "unknown"
 
 
 def is_functional_family(family: RelationFamily | str) -> bool:
@@ -101,10 +107,8 @@ def is_functional_family(family: RelationFamily | str) -> bool:
 def families_are_comparable(family1: str, family2: str) -> bool:
     if family1 == "unknown" or family2 == "unknown":
         return True
-
     if family1 == family2:
         return True
-
     return {family1, family2} == {"location_at_time", "movement"}
 
 
@@ -118,46 +122,52 @@ def _frame(relation: str, family: RelationFamily) -> RelationFrame:
     )
 
 
-def _contains_any(text: str, needles: list[str]) -> bool:
-    for needle in needles:
-        normalized = _normalize(needle)
-        if " " in normalized:
-            if normalized in text:
-                return True
-            continue
-
-        if re.search(rf"\b{re.escape(normalized)}\b", text):
-            return True
-
-    return False
-
-
-def _snake_relation(value: str) -> str:
-    token = ""
-    tokens: list[str] = []
-
-    for character in _normalize(value):
-        if character.isalnum():
-            token += character
-        elif token:
-            tokens.append(token)
-            token = ""
-
-    if token:
-        tokens.append(token)
-
-    return "_".join(tokens[:4])
-
-
-def _normalize(value: str) -> str:
-    return (
-        value.lower()
-        .replace("_", " ")
-        .replace("“", '"')
-        .replace("”", '"')
-        .replace("—", "-")
-        .replace("–", "-")
-        .replace("didn't", "did not")
-        .replace("don't", "do not")
-        .strip()
+def _build_classify_prompt(items: list[dict]) -> str:
+    families_desc = (
+        "movement: travel, go, leave, arrive, visit, drive, sail, fly, walk, return, enter, exit, head\n"
+        "sleep_time: sleep, rest, nap, go to bed\n"
+        "ownership: own, possess, have, acquire, buy, sell, belong\n"
+        "knowledge: know, remember, hear of, recognize, learn, understand, forget, recall\n"
+        "contact: meet, speak, call, greet, wave, text, email, communicate, interact\n"
+        "location_at_time: be at, stay, remain, live, reside, inhabit, dwell, located\n"
+        "action: order, watch, work, eat, drink, perform, make, create, other general actions\n"
+        "unknown: cannot determine"
     )
+
+    items_text = "\n".join(
+        f"{i + 1}. relation=\"{item['relation']}\" object=\"{item.get('object', '')}\" "
+        f"evidence=\"{item.get('evidence', '')[:120]}\" location=\"{item.get('location', '')}\""
+        for i, item in enumerate(items)
+    )
+
+    return f"""Classify each relation into one of these families:
+
+{families_desc}
+
+For each item, choose the family that best describes the primary action or state expressed by the relation in the given context. Prefer a specific family over "action" or "unknown" when the relation clearly fits. Return valid JSON only.
+
+Items:
+{items_text}
+
+Output: {{"families": [{{"family": "movement", "reason": "..."}}, ...]}}""".strip()
+
+
+def _extract_json(text: str) -> str:
+    trimmed = text.strip()
+    if trimmed.startswith("{") and trimmed.endswith("}"):
+        return trimmed
+    start = trimmed.find("{")
+    end = trimmed.rfind("}")
+    if start < 0 or end < start:
+        return "{}"
+    return trimmed[start : end + 1]
+
+
+def _normalize_family(value: str | None) -> RelationFamily:
+    if not isinstance(value, str):
+        return "unknown"
+    text = value.strip().lower().replace("_", " ")
+    for family in _FAMILIES:
+        if family.replace("_", " ") == text:
+            return family  # type: ignore[return-value]
+    return "unknown"
